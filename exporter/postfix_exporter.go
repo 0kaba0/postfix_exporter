@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hsn723/postfix_exporter/logsource"
 	"github.com/hsn723/postfix_exporter/showq"
@@ -814,6 +815,12 @@ func (e *PostfixExporter) Describe(ch chan<- *prometheus.Desc) {
 	e.postscreenAccessList.Describe(ch)
 }
 
+// Pause bounds between failed reads of the log source.
+var (
+	logRetryMinDelay = time.Second
+	logRetryMaxDelay = 30 * time.Second
+)
+
 func (e *PostfixExporter) StartMetricCollection(ctx context.Context) {
 	if e.logSrc == nil {
 		return
@@ -822,14 +829,25 @@ func (e *PostfixExporter) StartMetricCollection(ctx context.Context) {
 	gauge := e.postfixUp.WithLabelValues(e.logSrc.Path())
 	defer gauge.Set(0)
 
+	delay := logRetryMinDelay
 	for {
 		line, err := e.logSrc.Read(ctx)
-		if err != nil {
-			if err != logsource.SystemdNoMoreEntries {
-				slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error())
+		if err != nil && err != logsource.SystemdNoMoreEntries {
+			if ctx.Err() != nil {
 				return
 			}
+			// A source that fails once (e.g. kubelet restarting) recovers on a later read.
+			slog.Error("Couldn't read log source.", "source", e.logSrc.Path(), "error", err.Error(), "retry_in", delay)
+			gauge.Set(0)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
+			delay = min(delay*2, logRetryMaxDelay)
+			continue
 		}
+		delay = logRetryMinDelay
 		e.CollectFromLogLine(line)
 		gauge.Set(1)
 	}
